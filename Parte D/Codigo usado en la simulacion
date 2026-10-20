@@ -1,0 +1,124 @@
+
+void setup() {
+  pinMode(PIN_SW, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  Serial.begin(9600);
+  matriz.begin();
+  matriz.setBrightness(20); // Brillo reducido: escala 0..255.
+  apagarMatriz();
+
+  EEPROM.get(0, datos);
+  if (datos.marca != 0x534D || datos.version != 1 ||
+      datos.mejorNivel > MAX_PASOS || datos.ultimoNivel > MAX_PASOS ||
+      datos.ultimoEstado > FINAL) {
+    datos.marca = 0x534D;
+    datos.version = 1;
+    datos.ultimoNivel = datos.mejorNivel = datos.ultimoEstado = 0;
+    EEPROM.put(0, datos);
+  }
+  record = datos.mejorNivel;
+  Serial.print(F("Ultimo nivel: ")); Serial.println(datos.ultimoNivel);
+  Serial.print(F("Record (niveles completados): ")); Serial.println(record);
+  Serial.print(F("Ultimo estado (0 libre, 1 muestra, 2 jugador,"));
+  Serial.println(F(" 3 exito, 4 error, 5 final):"));
+  Serial.println(datos.ultimoEstado);
+  Serial.println(F("Pulsa corto para cambiar color; manten 0.8 s para jugar."));
+  sincronizarBoton();
+  entrarLibre(false);
+}
+
+void loop() {
+  actualizarBoton();
+
+  switch (estado) {
+    case LIBRE:
+      moverCursor();
+      if (pulsacionCorta) {
+        // Elegir al azar uno de los otros tres colores.
+        colorCursor = (colorCursor + 1 + random(3)) % 4;
+        dibujarCursor();
+        tone(PIN_BUZZER, frecuencias[colorCursor], 100);
+      }
+      if (pulsacionLarga || (continuar && millis() - inicioLibre >= 3000)) {
+        noTone(PIN_BUZZER);
+        if (!continuar) {
+          randomSeed(micros() ^ ((unsigned long)analogRead(PIN_X) << 10)
+                     ^ analogRead(PIN_Y));
+          cantidad = 0;
+        }
+        agregarPaso();
+        estado = MOSTRAR;
+        guardarDatos();
+      }
+      break;
+
+    case MOSTRAR:
+      Serial.print(F("Nivel: ")); Serial.println(cantidad);
+      apagarMatriz();
+      delay(600);
+      for (uint8_t i = 0; i < cantidad; i++) {
+        matriz.setPixelColor(indiceLED(secuencia[i].fila, secuencia[i].columna),
+                             colorRGB(secuencia[i].color));
+        matriz.show();
+        tone(PIN_BUZZER, frecuencias[secuencia[i].color]);
+        delay(500);
+        noTone(PIN_BUZZER);
+        apagarMatriz();
+        delay(200);
+      }
+      respuesta = 0;
+      fila = columna = 3;
+      movimientoHabilitado = false;
+      sincronizarBoton();
+      estado = JUGADOR;
+      guardarDatos();
+      dibujarCursor();
+      Serial.println(F("Tu turno: repite las posiciones y confirma con SW."));
+      break;
+
+    case JUGADOR:
+      moverCursor();
+      if (pulsacionCorta || pulsacionLarga) {
+        if (fila != secuencia[respuesta].fila ||
+            columna != secuencia[respuesta].columna) {
+          estado = ERROR_JUEGO;
+        } else {
+          tone(PIN_BUZZER, frecuencias[secuencia[respuesta].color], 120);
+          respuesta++;
+          if (respuesta == cantidad) estado = EXITO;
+        }
+      }
+      break;
+
+    case EXITO:
+      if (cantidad > record) record = cantidad;
+      guardarDatos();
+      Serial.print(F("Nivel superado. Record: ")); Serial.println(record);
+      animacion(1, 880);
+      if (cantidad == MAX_PASOS) {
+        estado = FINAL;
+      } else {
+        entrarLibre(true);
+        Serial.println(F("Siguiente nivel en 3 segundos."));
+      }
+      break;
+
+    case ERROR_JUEGO:
+      guardarDatos();
+      Serial.println(F("Error. Reiniciando desde nivel 1."));
+      animacion(0, 110);
+      cantidad = 0;
+      agregarPaso();
+      estado = MOSTRAR;
+      guardarDatos();
+      break;
+
+    case FINAL:
+      guardarDatos();
+      Serial.println(F("Completaste los 20 niveles. Manten SW para otra partida."));
+      animacion(3, 1047);
+      entrarLibre(false);
+      break;
+  }
+}
