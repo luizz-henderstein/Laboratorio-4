@@ -1,0 +1,133 @@
+#include <Adafruit_NeoPixel.h>
+
+// Primera etapa: entradas y cursor sobre la matriz de PICSimLab.
+const uint8_t PIN_X = A0, PIN_Y = A1, PIN_SW = 2;
+const uint8_t PIN_MATRIZ = 6;
+const bool INVERTIR_X = false, INVERTIR_Y = false;
+
+Adafruit_NeoPixel matriz(64, PIN_MATRIZ, NEO_GRB + NEO_KHZ800);
+
+uint8_t fila = 3, columna = 3, colorCursor = 2;
+bool movimientoHabilitado = false;
+
+bool botonCrudo = HIGH, botonEstable = HIGH;
+bool largoEmitido = false;
+bool pulsacionCorta = false, pulsacionLarga = false;
+
+unsigned long cambioBoton = 0, inicioPulsacion = 0;
+
+uint32_t colorRGB(uint8_t color) {
+  switch (color) {
+    case 0: return matriz.Color(255, 0, 0);
+    case 1: return matriz.Color(0, 255, 0);
+    case 2: return matriz.Color(0, 0, 255);
+    default: return matriz.Color(255, 255, 0);
+  }
+}
+
+uint8_t indiceLED(uint8_t f, uint8_t c) {
+  // PICSimLab: filas progresivas desde la esquina inferior izquierda.
+  return (7 - f) * 8 + c;
+}
+
+void apagarMatriz() {
+  matriz.clear();
+  matriz.show();
+}
+
+void dibujarCursor() {
+  matriz.clear();
+  matriz.setPixelColor(indiceLED(fila, columna), colorRGB(colorCursor));
+  matriz.show();
+}
+
+void sincronizarBoton() {
+  botonCrudo = botonEstable = digitalRead(PIN_SW);
+  cambioBoton = inicioPulsacion = millis();
+  largoEmitido = (botonEstable == LOW);
+  pulsacionCorta = pulsacionLarga = false;
+}
+
+void actualizarBoton() {
+  pulsacionCorta = pulsacionLarga = false;
+
+  unsigned long ahora = millis();
+  bool lectura = digitalRead(PIN_SW);
+
+  if (lectura != botonCrudo) {
+    botonCrudo = lectura;
+    cambioBoton = ahora;
+  }
+
+  if (ahora - cambioBoton >= 25 && botonEstable != botonCrudo) {
+    botonEstable = botonCrudo;
+
+    if (botonEstable == LOW) {
+      inicioPulsacion = ahora;
+      largoEmitido = false;
+    } else if (!largoEmitido) {
+      pulsacionCorta = true;
+    }
+  }
+
+  if (botonEstable == LOW && !largoEmitido &&
+      ahora - inicioPulsacion >= 800) {
+    largoEmitido = true;
+    pulsacionLarga = true;
+  }
+}
+
+void moverCursor() {
+  int x = analogRead(PIN_X), y = analogRead(PIN_Y);
+
+  if (INVERTIR_X) x = 1023 - x;
+  if (INVERTIR_Y) y = 1023 - y;
+
+  // Una casilla por inclinacion. Volver al centro para otro movimiento.
+  if (x >= 400 && x <= 624 && y >= 400 && y <= 624) {
+    movimientoHabilitado = true;
+    return;
+  }
+
+  if (!movimientoHabilitado) return;
+
+  if (x < 350) {
+    if (columna > 0) columna--;
+  } else if (x > 674) {
+    if (columna < 7) columna++;
+  } else if (y < 350) {
+    if (fila > 0) fila--;
+  } else if (y > 674) {
+    if (fila < 7) fila++;
+  } else {
+    return;
+  }
+
+  movimientoHabilitado = false;
+  dibujarCursor();
+}
+
+void setup() {
+  pinMode(PIN_SW, INPUT_PULLUP);
+  Serial.begin(9600);
+
+  matriz.begin();
+  matriz.setBrightness(20);
+  apagarMatriz();
+
+  randomSeed(micros() ^ analogRead(PIN_X));
+  sincronizarBoton();
+  dibujarCursor();
+
+  Serial.println(F("Etapa 1: mueve el cursor y pulsa corto para cambiar color."));
+}
+
+void loop() {
+  actualizarBoton();
+  moverCursor();
+
+  if (pulsacionCorta) {
+    colorCursor = (colorCursor + 1 + random(3)) % 4;
+    dibujarCursor();
+  }
+}
