@@ -190,18 +190,63 @@ static void salidas_actualizar(void)
     else PORTB &= ~(1 << PB2);
 }
 
+static uint8_t sensores_leer(void)
+{
+    static uint8_t ventana = 0;
+    uint16_t muestra = adc_leer();
+    uint8_t resultado = 0;
+    if (muestra < UMBRAL_LDR_BAJO) ventana = 1;
+    if (muestra > UMBRAL_LDR_ALTO) ventana = 0;
+    if (ventana) resultado |= ZONA_VENTANA;
+    if (!(PIND & (1 << PD4))) resultado |= ZONA_MOVIMIENTO;
+    return resultado;
+}
+
+static void alarma_disparar(const char *zona)
+{
+    if (!armada) return;
+    alarma = 1;
+    silenciada = 0;
+    uart_texto("ALARMA:ON;ZONA:");
+    uart_linea(zona);
+}
+
+static void sensores_procesar(uint8_t nuevas_zonas)
+{
+    uint8_t aparecieron = nuevas_zonas & ~zonas;
+    if (nuevas_zonas == zonas) return;
+    zonas = nuevas_zonas;
+    if (aparecieron & ZONA_VENTANA) alarma_disparar("VENTANA");
+    if (aparecieron & ZONA_MOVIMIENTO) alarma_disparar("MOVIMIENTO");
+    uart_estado();
+    lcd_estado();
+}
+
 int main(void)
 {
+    uint8_t muestras = 0, ultima_muestra = 0, repetidas = 0;
+    uint8_t ciclos_estado = 0;
     puertos_iniciar();
     adc_iniciar();
     uart_iniciar();
     lcd_iniciar();
+    uart_linea("ALARMA LISTA");
     lcd_estado();
     salidas_actualizar();
-    uart_linea("ALARMA LISTA");
-    uart_estado();
     for (;;) {
-        (void)adc_leer();
+        muestras = sensores_leer();
+        if (muestras == ultima_muestra) {
+            if (repetidas < 3) repetidas++;
+        } else {
+            repetidas = 0;
+        }
+        ultima_muestra = muestras;
+        if (repetidas == 3) sensores_procesar(muestras);
+        salidas_actualizar();
+        if (++ciclos_estado == 100) {
+            ciclos_estado = 0;
+            uart_estado();
+        }
         _delay_ms(20);
     }
 }
