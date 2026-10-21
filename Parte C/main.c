@@ -19,13 +19,36 @@ static uint8_t alarma = 0;
 static uint8_t silenciada = 0;
 static uint8_t zonas = 0;
 
+static volatile char rx_linea[24];
+static volatile uint8_t rx_largo = 0;
+static volatile uint8_t rx_lista = 0;
+
+ISR(USART_RX_vect)
+{
+    uint8_t errores = UCSR0A;
+    char c = UDR0;
+    if (errores & ((1 << FE0) | (1 << DOR0) | (1 << UPE0))) return;
+    if (rx_lista) return;
+    if (c == '\r' || c == '\n') {
+        if (rx_largo) {
+            rx_linea[rx_largo] = 0;
+            rx_lista = 1;
+        }
+    } else if (rx_largo < sizeof(rx_linea) - 1) {
+        if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
+        rx_linea[rx_largo++] = c;
+    } else {
+        rx_largo = 0;
+    }
+}
+
 static void uart_iniciar(void)
 {
     UBRR0H = (uint8_t)(UBRR_9600 >> 8);
     UBRR0L = (uint8_t)UBRR_9600;
     UCSR0A = 0;
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
-    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
 }
 
 static void uart_caracter(char c)
@@ -43,6 +66,17 @@ static void uart_linea(const char *s)
 {
     uart_texto(s);
     uart_texto("\r\n");
+}
+
+static void uart_numero(uint16_t n)
+{
+    char digitos[5];
+    uint8_t i = 0;
+    do {
+        digitos[i++] = '0' + (n % 10);
+        n /= 10;
+    } while (n);
+    while (i) uart_caracter(digitos[--i]);
 }
 
 static void uart_estado(void)
@@ -222,6 +256,72 @@ static void sensores_procesar(uint8_t nuevas_zonas)
     lcd_estado();
 }
 
+static uint8_t iguales(const char *a, const char *b)
+{
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+static void comando_procesar(const char *s)
+{
+    if (iguales(s, "ESTADO")) {
+        uart_estado();
+        return;
+    }
+    if (iguales(s, "LECTURA")) {
+        uart_texto("ADC_LDR:");
+        uart_numero(adc_leer());
+        uart_texto(";PRESENCIA:");
+        uart_caracter((PIND & (1 << PD4)) ? '0' : '1');
+        uart_texto("\r\n");
+        return;
+    }
+    if (iguales(s, "AUTO")) {
+        modo = MODO_AUTO;
+        armada = 1;
+        alarma = 0;
+        silenciada = 0;
+    } else if (iguales(s, "MANUAL")) {
+        modo = MODO_MANUAL;
+        armada = 0;
+        alarma = 0;
+        silenciada = 0;
+    } else if (iguales(s, "ARMAR") && modo == MODO_MANUAL) {
+        armada = 1;
+    } else if (iguales(s, "DESARMAR") && modo == MODO_MANUAL) {
+        armada = 0;
+        alarma = 0;
+        silenciada = 0;
+    } else if (iguales(s, "SILENCIO")) {
+        silenciada = 1;
+    } else if (iguales(s, "FORZAR") && modo == MODO_MANUAL) {
+        armada = 1;
+        alarma_disparar("REMOTA");
+    } else if (iguales(s, "RESET")) {
+        alarma = 0;
+        silenciada = 0;
+    } else {
+        uart_linea("ERROR:COMANDO_O_MODO");
+        return;
+    }
+    uart_linea("OK");
+    uart_estado();
+    lcd_estado();
+}
+
+static void comando_recibir(void)
+{
+    char copia[sizeof(rx_linea)];
+    uint8_t i, sreg = SREG;
+    cli();
+    if (!rx_lista) { SREG = sreg; return; }
+    for (i = 0; i <= rx_largo; i++) copia[i] = rx_linea[i];
+    rx_largo = 0;
+    rx_lista = 0;
+    SREG = sreg;
+    comando_procesar(copia);
+}
+
 int main(void)
 {
     uint8_t muestras = 0, ultima_muestra = 0, repetidas = 0;
@@ -230,10 +330,13 @@ int main(void)
     adc_iniciar();
     uart_iniciar();
     lcd_iniciar();
-    uart_linea("ALARMA LISTA");
+    sei();
+    uart_linea("ALARMA LISTA;COMANDOS: AUTO MANUAL ARMAR DESARMAR SILENCIO FORZAR RESET ESTADO LECTURA");
     lcd_estado();
     salidas_actualizar();
     for (;;) {
+        comando_recibir();
+
         muestras = sensores_leer();
         if (muestras == ultima_muestra) {
             if (repetidas < 3) repetidas++;
@@ -242,6 +345,7 @@ int main(void)
         }
         ultima_muestra = muestras;
         if (repetidas == 3) sensores_procesar(muestras);
+
         salidas_actualizar();
         if (++ciclos_estado == 100) {
             ciclos_estado = 0;
