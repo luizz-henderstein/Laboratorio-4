@@ -256,6 +256,19 @@ static void sensores_procesar(uint8_t nuevas_zonas)
     lcd_estado();
 }
 
+static uint8_t botones_eventos(void)
+{
+    static uint8_t anterior = 0xE0, estable = 0xE0;
+    uint8_t actual = PIND & 0xE0;
+    uint8_t eventos = 0;
+    if (actual == anterior && actual != estable) {
+        eventos = estable & ~actual;
+        estable = actual;
+    }
+    anterior = actual;
+    return eventos;
+}
+
 static uint8_t iguales(const char *a, const char *b)
 {
     while (*a && *b && *a == *b) { a++; b++; }
@@ -322,6 +335,17 @@ static void comando_recibir(void)
     comando_procesar(copia);
 }
 
+static void botones_procesar(uint8_t eventos)
+{
+    if (eventos & (1 << PD7)) {
+        comando_procesar(modo == MODO_AUTO ? "MANUAL" : "AUTO");
+    }
+    if (eventos & (1 << PD5)) {
+        comando_procesar(armada ? "DESARMAR" : "ARMAR");
+    }
+    if (eventos & (1 << PD6)) comando_procesar("SILENCIO");
+}
+
 int main(void)
 {
     uint8_t muestras = 0, ultima_muestra = 0, repetidas = 0;
@@ -336,6 +360,7 @@ int main(void)
     salidas_actualizar();
     for (;;) {
         comando_recibir();
+        botones_procesar(botones_eventos());
 
         muestras = sensores_leer();
         if (muestras == ultima_muestra) {
