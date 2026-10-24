@@ -1,0 +1,34 @@
+
+#ifndef ESCLAVO_HW_H
+#define ESCLAVO_HW_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define LED_VERDE PD4
+#define LED_ROJO PD6
+#define MOTOR_PWM PD5
+#define MOTOR_IN3 PD7
+#define MOTOR_IN4 PB0
+#define BUZZER PB1
+#define SERVO PD3
+
+#define CMD_START 0x10
+#define CMD_STOP 0x11
+#define CMD_SET_SPEED 0x20
+#define CMD_PISTON 0x30
+#define CMD_EMERGENCY 0x40
+
+void hardware_init(void);
+uint32_t millisC(void);
+
+void apagarMotor(void);
+void aplicarMotor(uint8_t velocidad);
+
+void indicarParo(void);
+void indicarMarcha(void);
+void indicarEmergencia(void);
+
+bool spi_recibir(uint8_t *comando, uint8_t *valor);
+
+#endif
