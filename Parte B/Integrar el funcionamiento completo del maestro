@@ -1,0 +1,340 @@
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+
+#include "maestro_hw.h"
+#include "maestro_io.h"
+
+#define TEMP_EMERGENCIA 40
+#define TEMP_REARME 35
+
+#define INTERVALO_DHT_MS 3000
+
+#define LDR_UMBRAL_ENTRADA 400
+#define LDR_UMBRAL_SALIDA 500
+
+bool procesoActivo = false;
+bool emergencia = false;
+bool piezaPresente = false;
+bool temperaturaValida = false;
+
+uint16_t contadorPiezas = 0;
+
+uint8_t velocidad = 0;
+uint8_t ultimaVelocidadEnviada = 255;
+
+int16_t temperatura = 0;
+uint8_t humedad = 0;
+
+const char *ultimoComando = "INICIO";
+
+uint32_t tDht = 0;
+uint32_t tPot = 0;
+uint32_t tLcd = 0;
+uint32_t tBoton = 0;
+
+bool botonAnterior = true;
+bool botonEstable = true;
+
+void registrarComando(const char *nombre)
+{
+    ultimoComando = nombre;
+}
+
+void activarEmergencia(void)
+{
+    emergencia = true;
+    procesoActivo = false;
+
+    enviarTrama(CMD_EMERGENCY, 0);
+    registrarComando("EMERG");
+}
+
+void enviarInicio(void)
+{
+    if (enviarTrama(CMD_START, 0))
+    {
+        registrarComando("START");
+    }
+
+    _delay_ms(2);
+
+    if (enviarTrama(CMD_SET_SPEED, velocidad))
+    {
+        ultimaVelocidadEnviada = velocidad;
+    }
+}
+
+void revisarBoton(void)
+{
+    bool lectura =
+        (PIND & (1 << PIN_BOTON)) != 0;
+
+    uint32_t ahora = millisC();
+
+    if (lectura != botonAnterior)
+    {
+        tBoton = ahora;
+        botonAnterior = lectura;
+    }
+
+    if ((ahora - tBoton) > 35 &&
+        lectura != botonEstable)
+    {
+        botonEstable = lectura;
+
+        if (!botonEstable)
+        {
+            if (emergencia)
+            {
+                if (temperaturaValida &&
+                    temperatura <= TEMP_REARME)
+                {
+                    emergencia = false;
+                    procesoActivo = true;
+
+                    enviarInicio();
+
+                    uart_linea("Sistema rearmado");
+                }
+            }
+            else
+            {
+                if (procesoActivo)
+                {
+                    procesoActivo = false;
+
+                    enviarTrama(CMD_STOP, 0);
+                    registrarComando("STOP");
+
+                    uart_linea("Proceso detenido");
+                }
+                else if (temperaturaValida &&
+                         temperatura < TEMP_EMERGENCIA)
+                {
+                    procesoActivo = true;
+
+                    enviarInicio();
+
+                    uart_linea("Proceso iniciado");
+                }
+                else
+                {
+                    uart_linea("Temperatura no segura");
+                }
+            }
+        }
+    }
+}
+
+void leerVelocidad(void)
+{
+    uint32_t ahora = millisC();
+
+    if (ahora - tPot < 100)
+        return;
+
+    tPot = ahora;
+
+    uint16_t lectura = adc_leer(1);
+
+    velocidad =
+        (uint32_t)lectura * 255UL / 1023UL;
+
+    int16_t diferencia =
+        (int16_t)velocidad -
+        (int16_t)ultimaVelocidadEnviada;
+
+    if (diferencia < 0)
+        diferencia = -diferencia;
+
+    if (procesoActivo &&
+        !emergencia &&
+        diferencia >= 3)
+    {
+        if (enviarTrama(CMD_SET_SPEED, velocidad))
+        {
+            ultimaVelocidadEnviada = velocidad;
+            registrarComando("VEL");
+        }
+    }
+}
+
+void leerLdr(void)
+{
+    uint16_t lectura = adc_leer(0);
+
+    if (!piezaPresente &&
+        lectura < LDR_UMBRAL_ENTRADA)
+    {
+        piezaPresente = true;
+
+        if (procesoActivo && !emergencia)
+        {
+            contadorPiezas++;
+
+            if (enviarTrama(CMD_PISTON, 0))
+            {
+                registrarComando("PIST");
+            }
+
+            uart_print("Pieza detectada. Total: ");
+            uart_numero(contadorPiezas);
+            uart_print("\r\n");
+        }
+    }
+    else if (piezaPresente &&
+             lectura > LDR_UMBRAL_SALIDA)
+    {
+        piezaPresente = false;
+    }
+}
+
+void leerTemperatura(void)
+{
+    uint32_t ahora = millisC();
+
+    if (ahora - tDht < INTERVALO_DHT_MS)
+        return;
+
+    tDht = ahora;
+
+    int16_t nuevaTemperatura;
+    uint8_t nuevaHumedad;
+
+    if (!dht_leer(&nuevaTemperatura, &nuevaHumedad))
+    {
+        temperaturaValida = false;
+
+        uart_linea("ERROR: lectura DHT11");
+
+        if (procesoActivo)
+        {
+            activarEmergencia();
+
+            uart_linea(
+                "EMERGENCIA: fallo del sensor"
+            );
+        }
+
+        return;
+    }
+
+    temperatura = nuevaTemperatura;
+    humedad = nuevaHumedad;
+    temperaturaValida = true;
+
+    uart_print("Temperatura: ");
+    uart_numero(temperatura);
+
+    uart_print(" C | Humedad: ");
+    uart_numero(humedad);
+    uart_print(" %\r\n");
+
+    if (!emergencia &&
+        temperatura >= TEMP_EMERGENCIA)
+    {
+        activarEmergencia();
+
+        uart_linea(
+            "EMERGENCIA: temperatura elevada"
+        );
+    }
+}
+
+void actualizarLcd(void)
+{
+    uint32_t ahora = millisC();
+
+    if (ahora - tLcd < 250)
+        return;
+
+    tLcd = ahora;
+
+    char linea1[17];
+    char linea2[17];
+
+    char estado;
+
+    if (emergencia)
+        estado = 'E';
+    else if (procesoActivo)
+        estado = 'R';
+    else
+        estado = 'S';
+
+    if (temperaturaValida)
+    {
+        snprintf(
+            linea1,
+            sizeof(linea1),
+            "%c T:%2d V:%3u",
+            estado,
+            (int)temperatura,
+            (unsigned int)velocidad
+        );
+    }
+    else
+    {
+        snprintf(
+            linea1,
+            sizeof(linea1),
+            "%c T:-- V:%3u",
+            estado,
+            (unsigned int)velocidad
+        );
+    }
+
+    snprintf(
+        linea2,
+        sizeof(linea2),
+        "P:%03u C:%-5s",
+        (unsigned int)(contadorPiezas % 1000),
+        ultimoComando
+    );
+
+    imprimirLinea(0, linea1);
+    imprimirLinea(1, linea2);
+}
+
+int main(void)
+{
+    cli();
+
+    hardware_init();
+
+    sei();
+
+    uart_linea("Iniciando Arduino maestro...");
+
+    lcdBegin();
+
+    imprimirLinea(0, "Proceso SPI");
+    imprimirLinea(1, "Iniciando DHT11");
+
+    _delay_ms(1500);
+
+    tDht = millisC() - INTERVALO_DHT_MS;
+
+    leerTemperatura();
+
+    imprimirLinea(0, "Proceso SPI");
+    imprimirLinea(1, "Sistema listo");
+
+    uart_linea("Sistema listo");
+
+    while (1)
+    {
+        revisarBoton();
+        leerVelocidad();
+        leerLdr();
+        leerTemperatura();
+        actualizarLcd();
+    }
+}
