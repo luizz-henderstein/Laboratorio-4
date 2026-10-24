@@ -32,3 +32,168 @@ void indicarEmergencia(void);
 bool spi_recibir(uint8_t *comando, uint8_t *valor);
 
 #endif
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include "esclavo_hw.h"
+
+#define ACK 0xA5
+#define NACK 0x5A
+
+static volatile uint32_t tiempoMs = 0;
+
+static volatile uint8_t faseSpi = 0;
+static volatile uint8_t comandoRx = 0;
+static volatile uint8_t valorRx = 0;
+static volatile bool tramaLista = false;
+
+ISR(TIMER2_COMPA_vect)
+{
+    tiempoMs++;
+}
+
+uint32_t millisC(void)
+{
+    uint32_t t;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        t = tiempoMs;
+    }
+
+    return t;
+}
+
+ISR(SPI_STC_vect)
+{
+    uint8_t dato = SPDR;
+
+    if (faseSpi == 0)
+    {
+        comandoRx = dato;
+        faseSpi = 1;
+        SPDR = 0;
+    }
+    else if (faseSpi == 1)
+    {
+        if (!tramaLista)
+        {
+            valorRx = dato;
+            tramaLista = true;
+            SPDR = ACK;
+        }
+        else
+        {
+            SPDR = NACK;
+        }
+
+        faseSpi = 2;
+    }
+    else
+    {
+        faseSpi = 0;
+        SPDR = 0;
+    }
+}
+
+ISR(PCINT0_vect)
+{
+    if (PINB & (1 << PB2))
+    {
+        faseSpi = 0;
+        SPDR = 0;
+    }
+}
+
+bool spi_recibir(uint8_t *comando, uint8_t *valor)
+{
+    bool disponible = false;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        if (tramaLista)
+        {
+            *comando = comandoRx;
+            *valor = valorRx;
+            tramaLista = false;
+            disponible = true;
+        }
+    }
+
+    return disponible;
+}
+
+void apagarMotor(void)
+{
+    OCR0B = 0;
+    PORTD &= ~(1 << MOTOR_IN3);
+    PORTB &= ~(1 << MOTOR_IN4);
+}
+
+void aplicarMotor(uint8_t velocidad)
+{
+    PORTD |= (1 << MOTOR_IN3);
+    PORTB &= ~(1 << MOTOR_IN4);
+    OCR0B = velocidad;
+}
+
+void indicarParo(void)
+{
+    PORTD &= ~((1 << LED_VERDE) | (1 << LED_ROJO));
+    PORTB &= ~(1 << BUZZER);
+}
+
+void indicarMarcha(void)
+{
+    PORTD |= (1 << LED_VERDE);
+    PORTD &= ~(1 << LED_ROJO);
+    PORTB &= ~(1 << BUZZER);
+}
+
+void indicarEmergencia(void)
+{
+    PORTD &= ~(1 << LED_VERDE);
+    PORTD |= (1 << LED_ROJO);
+    PORTB |= (1 << BUZZER);
+}
+
+void hardware_init(void)
+{
+    DDRD |=
+        (1 << LED_VERDE) |
+        (1 << LED_ROJO) |
+        (1 << MOTOR_PWM) |
+        (1 << MOTOR_IN3);
+
+    DDRB |=
+        (1 << MOTOR_IN4) |
+        (1 << BUZZER) |
+        (1 << PB4);
+
+    DDRB &= ~((1 << PB2) |
+              (1 << PB3) |
+              (1 << PB5));
+
+    TCCR0A =
+        (1 << COM0B1) |
+        (1 << WGM00) |
+        (1 << WGM01);
+
+    TCCR0B = (1 << CS01) | (1 << CS00);
+    OCR0B = 0;
+
+    TCCR2A = (1 << WGM21);
+    TCCR2B = (1 << CS22);
+    OCR2A = 249;
+    TIMSK2 = (1 << OCIE2A);
+
+    SPCR = (1 << SPE) | (1 << SPIE);
+    SPDR = 0;
+
+    PCICR |= (1 << PCIE0);
+    PCMSK0 |= (1 << PCINT2);
+
+    apagarMotor();
+    indicarParo();
+}
