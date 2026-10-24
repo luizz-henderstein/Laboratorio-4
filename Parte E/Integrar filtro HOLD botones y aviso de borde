@@ -1,0 +1,549 @@
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <util/atomic.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#define MPU_ADDR 0x68
+#define CENTRO 4
+
+/* Declaraciones */
+void placa_iniciar(void);
+uint32_t micros_c(void);
+uint32_t millis_c(void);
+void pausa_ms(uint16_t ms);
+void uart_texto(const char *s);
+void uart_numero(int32_t n);
+void uart_decimal(float n, uint8_t decimales);
+void uart_hex(uint8_t n);
+bool i2c_escribir_reg(uint8_t dir, uint8_t reg, uint8_t dato);
+bool i2c_leer_reg(uint8_t dir, uint8_t reg, uint8_t *dato);
+bool i2c_leer_bloque(uint8_t dir, uint8_t reg, uint8_t *buffer, uint8_t cantidad);
+bool boton_nivel(uint8_t pin);
+void buzzer(bool activo);
+typedef struct {
+    float roll;
+    float pitch;
+    float velocidad_roll;
+    float velocidad_pitch;
+} LecturaMPU;
+bool mpu_iniciar(uint8_t *identidad);
+bool mpu_leer(LecturaMPU *salida);
+void matriz_iniciar(void);
+void matriz_limpiar(void);
+void matriz_pixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b);
+void matriz_mostrar(void);
+void matriz_error(void);
+uint8_t angulo_indice(float angulo);
+void elegir_color(float roll, float pitch, uint8_t *r, uint8_t *g, uint8_t *b);
+typedef struct {
+    uint16_t firma;
+    float offset_roll;
+    float offset_pitch;
+} DatosCalibracion;
+extern DatosCalibracion calibracion;
+void calibracion_cargar(void);
+bool calibracion_ejecutar(void);
+/* Implementaciones */
+
+static volatile uint32_t desbordes_t1 = 0;
+ISR(TIMER1_OVF_vect) { desbordes_t1++; }
+
+uint32_t micros_c(void)
+{
+    uint32_t ov;
+    uint16_t t;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        ov = desbordes_t1;
+        t = TCNT1;
+        if ((TIFR1 & (1 << TOV1)) && t < 65535) ov++;
+    }
+    return (ov << 15) + (t >> 1);
+}
+uint32_t millis_c(void) { return micros_c() / 1000UL; }
+void pausa_ms(uint16_t ms)
+{
+    uint32_t inicio = millis_c();
+    while ((uint32_t)(millis_c() - inicio) < ms) { }
+}
+static void uart_caracter(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0))) { }
+    UDR0 = c;
+}
+void uart_texto(const char *s)
+{
+    while (*s) uart_caracter(*s++);
+}
+void uart_numero(int32_t n)
+{
+    char b[16];
+    ltoa(n, b, 10);
+    uart_texto(b);
+}
+void uart_decimal(float n, uint8_t decimales)
+{
+    char b[22];
+    dtostrf(n, 0, decimales, b);
+    uart_texto(b);
+}
+void uart_hex(uint8_t n)
+{
+    const char h[] = "0123456789ABCDEF";
+    uart_caracter(h[n >> 4]);
+    uart_caracter(h[n & 15]);
+}
+static bool twi_esperar(void)
+{
+    uint16_t intentos = 60000;
+    while (!(TWCR & (1 << TWINT))) {
+        if (--intentos == 0) return false;
+    }
+    return true;
+}
+static bool twi_inicio(void)
+{
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    return twi_esperar();
+}
+static bool twi_enviar(uint8_t dato)
+{
+    TWDR = dato;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    return twi_esperar();
+}
+static bool twi_recibir(uint8_t *dato, bool ack)
+{
+    TWCR = (1 << TWINT) | (1 << TWEN) | (ack ? (1 << TWEA) : 0);
+    if (!twi_esperar()) return false;
+    *dato = TWDR;
+    return true;
+}
+static void twi_parar(void)
+{
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+bool i2c_escribir_reg(uint8_t dir, uint8_t reg, uint8_t dato)
+{
+    bool ok = twi_inicio() && twi_enviar(dir << 1) &&
+              twi_enviar(reg) && twi_enviar(dato);
+    twi_parar();
+    return ok;
+}
+bool i2c_leer_bloque(uint8_t dir, uint8_t reg, uint8_t *b, uint8_t n)
+{
+    if (!n) return false;
+    bool ok = twi_inicio() && twi_enviar(dir << 1) && twi_enviar(reg) &&
+              twi_inicio() && twi_enviar((dir << 1) | 1);
+    for (uint8_t i = 0; ok && i < n; i++) {
+        ok = twi_recibir(&b[i], i + 1 < n);
+    }
+    twi_parar();
+    return ok;
+}
+bool i2c_leer_reg(uint8_t dir, uint8_t reg, uint8_t *dato)
+{
+    return i2c_leer_bloque(dir, reg, dato, 1);
+}
+bool boton_nivel(uint8_t pin) { return (PIND & (1 << pin)) != 0; }
+void buzzer(bool activo)
+{
+    if (activo) PORTB |= (1 << PB1);
+    else PORTB &= ~(1 << PB1);
+}
+void placa_iniciar(void)
+{
+    DDRD &= ~((1 << PD2) | (1 << PD3));
+    PORTD |= (1 << PD2) | (1 << PD3);
+    DDRB |= (1 << PB1);
+    buzzer(false);
+    UBRR0H = 0;
+    UBRR0L = 16;  /* 115200 baudios aprox., U2X0=1 */
+    UCSR0A = (1 << U2X0);
+    UCSR0B = (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+    TCCR1A = 0;
+    TCCR1B = (1 << CS11);
+    TIMSK1 = (1 << TOIE1);
+    TWSR = 0;
+    TWBR = 12; /* 400 kHz */
+    TWCR = (1 << TWEN);
+    sei();
+}
+
+static int16_t entero16(const uint8_t *p)
+{
+    return (int16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+bool mpu_iniciar(uint8_t *identidad)
+{
+    if (!i2c_escribir_reg(MPU_ADDR, 0x6B, 0x00) ||
+        !i2c_escribir_reg(MPU_ADDR, 0x1A, 0x03) ||
+        !i2c_escribir_reg(MPU_ADDR, 0x1B, 0x00) ||
+        !i2c_escribir_reg(MPU_ADDR, 0x1C, 0x00)) return false;
+    pausa_ms(100);
+    return i2c_leer_reg(MPU_ADDR, 0x75, identidad) && *identidad == 0x68;
+}
+bool mpu_leer(LecturaMPU *s)
+{
+    uint8_t d[14];
+    if (!i2c_leer_bloque(MPU_ADDR, 0x3B, d, 14)) return false;
+    float ax = entero16(&d[0]) / 16384.0f;
+    float ay = entero16(&d[2]) / 16384.0f;
+    float az = entero16(&d[4]) / 16384.0f;
+    s->velocidad_roll = entero16(&d[8]) / 131.0f;
+    s->velocidad_pitch = entero16(&d[10]) / 131.0f;
+    s->roll = atan2f(ay, az) * 57.2957795f;
+    s->pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2957795f;
+    return true;
+}
+
+
+#define SERPENTINA 1
+#define ANGULO_MAXIMO 30.0f
+#define ZONA_MUERTA 3.0f
+#define BRILLO 35
+
+/* 64 pixeles x 3 bytes, en orden GRB. */
+static uint8_t leds[64][3];
+
+static uint8_t escala(uint8_t valor)
+{
+    return (uint16_t)valor * BRILLO / 255;
+}
+static uint8_t indice(uint8_t x, uint8_t y)
+{
+    if (SERPENTINA && (y & 1)) x = 7 - x;
+    return y * 8 + x;
+}
+void matriz_iniciar(void)
+{
+    DDRD |= (1 << PD6);
+    PORTD &= ~(1 << PD6);
+    matriz_limpiar();
+    matriz_mostrar();
+}
+void matriz_limpiar(void) { memset(leds, 0, sizeof(leds)); }
+void matriz_pixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x > 7 || y > 7) return;
+    uint8_t i = indice(x, y);
+    leds[i][0] = escala(g);
+    leds[i][1] = escala(r);
+    leds[i][2] = escala(b);
+}
+
+/* Tren WS2812B de 800 kHz, 20 ciclos/bit @16 MHz.
+   Requiere PD6, 16 MHz y optimizacion del compilador. */
+static void enviar_byte(uint8_t dato, uint8_t alto, uint8_t bajo)
+{
+    uint8_t contador;
+    asm volatile (
+        "ldi %[n], 8             \n\t"
+        "ciclo%=:               \n\t"
+        "out %[port], %[hi]     \n\t"
+        "lsl %[val]             \n\t"
+        "dec %[n]               \n\t"
+        "rjmp .+0               \n\t"
+        "brcs uno%=             \n\t"
+        "out %[port], %[lo]     \n\t"
+        "uno%=:                 \n\t"
+        "rjmp .+0               \n\t"
+        "nop                    \n\t"
+        "nop                    \n\t"
+        "nop                    \n\t"
+        "out %[port], %[lo]     \n\t"
+        "nop                    \n\t"
+        "nop                    \n\t"
+        "nop                    \n\t"
+        "nop                    \n\t"
+        "breq fin%=             \n\t"
+        "rjmp ciclo%=           \n\t"
+        "fin%=:                 \n\t"
+        : [n] "=&d" (contador), [val] "+r" (dato)
+        : [port] "I" (_SFR_IO_ADDR(PORTD)),
+          [hi] "r" (alto), [lo] "r" (bajo)
+        : "cc", "memory"
+    );
+}
+void matriz_mostrar(void)
+{
+    uint8_t estado = SREG;
+    uint8_t bajo = PORTD & ~(1 << PD6);
+    uint8_t alto = bajo | (1 << PD6);
+    cli();
+    for (uint8_t i = 0; i < 64; i++) {
+        for (uint8_t c = 0; c < 3; c++) {
+            enviar_byte(leds[i][c], alto, bajo);
+        }
+    }
+    PORTD = bajo;
+    SREG = estado;
+    _delay_us(80);
+}
+void matriz_error(void)
+{
+    matriz_limpiar();
+    for (uint8_t i = 0; i < 8; i++) {
+        matriz_pixel(i, i, 255, 0, 0);
+        matriz_pixel(7 - i, i, 255, 0, 0);
+    }
+    matriz_mostrar();
+}
+uint8_t angulo_indice(float angulo)
+{
+    if (angulo < -ANGULO_MAXIMO) angulo = -ANGULO_MAXIMO;
+    if (angulo > ANGULO_MAXIMO) angulo = ANGULO_MAXIMO;
+    float v = (angulo + ANGULO_MAXIMO) * 7.0f / (2.0f * ANGULO_MAXIMO);
+    int8_t pos = (int8_t)lroundf(v);
+    if (pos < 0) pos = 0;
+    if (pos > 7) pos = 7;
+    return (uint8_t)pos;
+}
+void elegir_color(float roll, float pitch, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    float ar = fabsf(roll);
+    float ap = fabsf(pitch);
+    if (ar <= ZONA_MUERTA && ap <= ZONA_MUERTA) {
+        *r = 0; *g = 0; *b = 255;
+    } else if (ar > ap * 1.35f) {
+        *r = 255; *g = 0; *b = 0;
+    } else if (ap > ar * 1.35f) {
+        *r = 0; *g = 255; *b = 0;
+    } else {
+        *r = 255; *g = 150; *b = 0;
+    }
+}
+
+
+#define FIRMA_CALIBRACION 0x6040
+DatosCalibracion calibracion;
+
+void calibracion_cargar(void)
+{
+    eeprom_read_block(&calibracion, (const void *)0, sizeof(calibracion));
+    bool valida = calibracion.firma == FIRMA_CALIBRACION &&
+        isfinite(calibracion.offset_roll) &&
+        isfinite(calibracion.offset_pitch) &&
+        fabsf(calibracion.offset_roll) < 90.0f &&
+        fabsf(calibracion.offset_pitch) < 90.0f;
+    if (!valida) {
+        calibracion.firma = FIRMA_CALIBRACION;
+        calibracion.offset_roll = 0;
+        calibracion.offset_pitch = 0;
+        uart_texto("Sin calibracion. Nivele y pulse CALIBRAR.\r\n");
+    } else {
+        uart_texto("Calibracion recuperada de EEPROM.\r\n");
+    }
+}
+bool calibracion_ejecutar(void)
+{
+    uart_texto("CALIBRANDO: no mover durante 2 segundos...\r\n");
+    matriz_limpiar();
+    for (uint8_t y = 3; y <= 4; y++)
+        for (uint8_t x = 3; x <= 4; x++)
+            matriz_pixel(x, y, 80, 80, 80);
+    matriz_mostrar();
+
+    uint16_t validas = 0;
+    float suma_roll = 0, suma_pitch = 0;
+    for (uint16_t i = 0; i < 150; i++) {
+        LecturaMPU d;
+        if (mpu_leer(&d)) {
+            suma_roll += d.roll;
+            suma_pitch += d.pitch;
+            validas++;
+        }
+        pausa_ms(12);
+    }
+    if (validas < 100) {
+        uart_texto("ERROR: no se pudo calibrar MPU6050.\r\n");
+        matriz_error();
+        pausa_ms(1000);
+        return false;
+    }
+    calibracion.firma = FIRMA_CALIBRACION;
+    calibracion.offset_roll = suma_roll / validas;
+    calibracion.offset_pitch = suma_pitch / validas;
+    eeprom_update_block(&calibracion, (void *)0, sizeof(calibracion));
+    uart_texto("Calibracion guardada: roll=");
+    uart_decimal(calibracion.offset_roll, 2);
+    uart_texto(" pitch=");
+    uart_decimal(calibracion.offset_pitch, 2);
+    uart_texto("\r\n");
+    return true;
+}
+/* Programa principal */
+
+#define PERIODO_MUESTREO_MS 20
+#define ALFA_FILTRO 0.96f
+#define ZONA_MUERTA 3.0f
+#define INVERTIR_X 0
+#define INVERTIR_Y 0
+
+typedef struct {
+    bool anterior;
+    bool estable;
+    uint32_t ultimo_cambio;
+} EstadoBoton;
+
+static EstadoBoton boton_hold = {true, true, 0};
+static EstadoBoton boton_calibrar = {true, true, 0};
+static float roll_filtrado = 0, pitch_filtrado = 0;
+static bool modo_hold = false, estaba_borde = false;
+static uint8_t bx = CENTRO, by = CENTRO;
+static uint8_t rojo = 0, verde = 0, azul = 255;
+static uint32_t fin_parpadeo = 0, apagar_buzzer = 0;
+static uint32_t ultimo_muestreo = 0, ultimo_serial = 0, ultimo_dibujo = 0;
+static uint32_t ultimo_tiempo_us = 0;
+
+static bool boton_presionado(uint8_t pin, EstadoBoton *b)
+{
+    bool lectura = boton_nivel(pin);
+    uint32_t ahora = millis_c();
+    if (lectura != b->anterior) {
+        b->anterior = lectura;
+        b->ultimo_cambio = ahora;
+    }
+    if ((uint32_t)(ahora - b->ultimo_cambio) > 35 && lectura != b->estable) {
+        b->estable = lectura;
+        return !lectura;
+    }
+    return false;
+}
+static void dibujar_burbuja(bool visible)
+{
+    matriz_limpiar();
+    if (visible) matriz_pixel(bx, by, rojo, verde, azul);
+    matriz_mostrar();
+}
+static void avisar_borde(void)
+{
+    buzzer(true);
+    uint32_t ahora = millis_c();
+    apagar_buzzer = ahora + 120;
+    fin_parpadeo = ahora + 450;
+}
+static void actualizar_buzzer(void)
+{
+    if (apagar_buzzer != 0 && (int32_t)(millis_c() - apagar_buzzer) >= 0) {
+        buzzer(false);
+        apagar_buzzer = 0;
+    }
+}
+static void reiniciar_tras_calibracion(void)
+{
+    roll_filtrado = calibracion.offset_roll;
+    pitch_filtrado = calibracion.offset_pitch;
+    bx = CENTRO; by = CENTRO;
+    rojo = 0; verde = 0; azul = 255;
+    estaba_borde = false;
+    modo_hold = false;
+    ultimo_tiempo_us = micros_c();
+    ultimo_muestreo = millis_c();
+    dibujar_burbuja(true);
+}
+static void informe(float roll, float pitch)
+{
+    uart_texto("Roll X: ");
+    uart_decimal(roll, 1);
+    uart_texto(" grados | Pitch Y: ");
+    uart_decimal(pitch, 1);
+    uart_texto(" grados | X=");
+    uart_numero(bx);
+    uart_texto(" Y=");
+    uart_numero(by);
+    uart_texto(" | HOLD=");
+    uart_texto(modo_hold ? "ON\r\n" : "OFF\r\n");
+}
+int main(void)
+{
+    placa_iniciar();
+    uart_texto("\r\nBurbuja de inclinacion - Laboratorio 4, parte E\r\n");
+    matriz_iniciar();
+    pausa_ms(100);
+    uint8_t identidad = 0xFF;
+    if (!mpu_iniciar(&identidad)) {
+        uart_texto("ERROR MPU6050 WHO_AM_I=0x");
+        uart_hex(identidad);
+        uart_texto("\r\n");
+        for (;;) {
+            matriz_error();
+            pausa_ms(350);
+            matriz_limpiar();
+            matriz_mostrar();
+            pausa_ms(350);
+        }
+    }
+    calibracion_cargar();
+    LecturaMPU inicial;
+    if (mpu_leer(&inicial)) {
+        roll_filtrado = inicial.roll;
+        pitch_filtrado = inicial.pitch;
+    }
+    ultimo_tiempo_us = micros_c();
+    ultimo_muestreo = millis_c();
+    dibujar_burbuja(true);
+    uart_texto("HOLD: D2. CALIBRAR: D3. Serial: 115200.\r\n");
+
+    for (;;) {
+        actualizar_buzzer();
+        if (boton_presionado(PD2, &boton_hold)) {
+            modo_hold = !modo_hold;
+            uart_texto(modo_hold ? "Modo HOLD ACTIVADO\r\n" : "Modo HOLD DESACTIVADO\r\n");
+        }
+        if (boton_presionado(PD3, &boton_calibrar)) {
+            if (calibracion_ejecutar()) reiniciar_tras_calibracion();
+        }
+        uint32_t ahora = millis_c();
+        if ((uint32_t)(ahora - ultimo_muestreo) < PERIODO_MUESTREO_MS) continue;
+        ultimo_muestreo = ahora;
+        LecturaMPU d;
+        if (!mpu_leer(&d)) {
+            uart_texto("Lectura I2C fallida.\r\n");
+            continue;
+        }
+        uint32_t ahora_us = micros_c();
+        float dt = (uint32_t)(ahora_us - ultimo_tiempo_us) / 1000000.0f;
+        ultimo_tiempo_us = ahora_us;
+        if (dt <= 0.0f || dt > 0.2f) dt = 0.020f;
+        roll_filtrado = ALFA_FILTRO * (roll_filtrado + d.velocidad_roll * dt)
+                     + (1.0f - ALFA_FILTRO) * d.roll;
+        pitch_filtrado = ALFA_FILTRO * (pitch_filtrado + d.velocidad_pitch * dt)
+                      + (1.0f - ALFA_FILTRO) * d.pitch;
+        float roll = roll_filtrado - calibracion.offset_roll;
+        float pitch = pitch_filtrado - calibracion.offset_pitch;
+        if (INVERTIR_X) roll = -roll;
+        if (INVERTIR_Y) pitch = -pitch;
+        if (!modo_hold) {
+            if (fabsf(roll) <= ZONA_MUERTA && fabsf(pitch) <= ZONA_MUERTA) {
+                bx = CENTRO;
+                by = CENTRO;
+            } else {
+                bx = angulo_indice(roll);
+                by = angulo_indice(pitch);
+            }
+            elegir_color(roll, pitch, &rojo, &verde, &azul);
+            bool en_borde = bx == 0 || bx == 7 || by == 0 || by == 7;
+            if (en_borde && !estaba_borde) avisar_borde();
+            estaba_borde = en_borde;
+        }
+        if ((uint32_t)(ahora - ultimo_dibujo) >= 50) {
+            ultimo_dibujo = ahora;
+            bool visible = true;
+            if ((int32_t)(fin_parpadeo - ahora) > 0)
+                visible = ((ahora / 100) % 2) == 0;
+            dibujar_burbuja(visible);
+        }
+        if ((uint32_t)(ahora - ultimo_serial) >= 250) {
+            ultimo_serial = ahora;
+            informe(roll, pitch);
+        }
+    }
+}
