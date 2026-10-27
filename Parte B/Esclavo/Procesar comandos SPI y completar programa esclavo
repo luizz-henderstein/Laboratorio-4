@@ -1,0 +1,93 @@
+  static void procesar_comando(uint8_t comando, uint8_t valor)
+  {
+      switch (comando) {
+      case CMD_START:
+          emergencia = false;
+          proceso_activo = true;
+          indicar_marcha();
+          aplicar_motor();
+          break;
+
+      case CMD_STOP:
+          proceso_activo = false;
+          apagar_motor();
+          servo_angulo(ANGULO_REPOSO);
+          piston_extendido = false;
+          indicar_paro();
+          break;
+
+      case CMD_SET_SPEED:
+          velocidad = valor;
+          aplicar_motor();
+          break;
+
+      case CMD_PISTON:
+          if (proceso_activo && !emergencia) {
+              servo_angulo(ANGULO_PISTON);
+              piston_extendido = true;
+              retorno_piston = millis_c() + TIEMPO_PISTON;
+          }
+          break;
+
+      case CMD_EMERGENCY:
+          emergencia = true;
+          proceso_activo = false;
+          apagar_motor();
+          servo_angulo(ANGULO_REPOSO);
+          piston_extendido = false;
+          indicar_emergencia();
+          break;
+
+      default:
+          break;
+      }
+  }
+
+  static void iniciar(void)
+  {
+      DDRD |= (1 << SERVO) | (1 << LED_VERDE) | (1 << MOTOR_PWM) |
+              (1 << LED_ROJO) | (1 << MOTOR_IN3);
+      DDRB |= (1 << MOTOR_IN4) | (1 << BUZZER) | (1 << PB4); /* MISO */
+      DDRB &= ~((1 << SS) | (1 << PB3) | (1 << PB5));
+
+      apagar_motor();
+      indicar_paro();
+
+      TCCR0A = (1 << WGM00) | (1 << WGM01);
+      TCCR0B = (1 << WGM02) | (1 << CS01) | (1 << CS00);
+      OCR0A = 249;
+      TIMSK0 = (1 << TOIE0);
+
+      TCCR1A = (1 << WGM11);
+      TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11);
+      ICR1 = 39999;
+      TIMSK1 = (1 << TOIE1) | (1 << OCIE1A);
+      servo_angulo(ANGULO_REPOSO);
+
+      SPCR = (1 << SPE) | (1 << SPIE);
+      SPDR = 0;
+      sei();
+  }
+
+  int main(void)
+  {
+      iniciar();
+
+      while (1) {
+          if (trama_lista) {
+              uint8_t comando, valor;
+              cli();
+              comando = comando_recibido;
+              valor = valor_recibido;
+              trama_lista = false;
+              sei();
+              procesar_comando(comando, valor);
+          }
+
+          if (piston_extendido &&
+              (int32_t)(millis_c() - retorno_piston) >= 0) {
+              servo_angulo(ANGULO_REPOSO);
+              piston_extendido = false;
+          }
+      }
+  }
