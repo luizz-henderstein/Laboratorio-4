@@ -1,0 +1,145 @@
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+#define DHT       PD2
+#define BOTON     PD3
+#define SS        PB2
+#define LCD_ADDR  0x27
+#define LCD_RS    0x01
+#define LCD_EN    0x04
+#define LCD_LUZ   0x08
+#define ACK       0xA5
+
+enum {
+    CMD_START = 0x10, CMD_STOP = 0x11, CMD_VEL = 0x20,
+    CMD_PISTON = 0x30, CMD_EMERG = 0x40
+};
+
+static volatile uint32_t ms = 0;
+static bool activo = false, emergencia = false;
+static bool pieza = false, temp_valida = false;
+static bool boton_anterior = true, boton_estable = true;
+static uint8_t velocidad = 0, ultima_velocidad = 255;
+static uint16_t contador = 0;
+static float temperatura = 0, humedad = 0;
+static const char *ultimo_cmd = "INICIO";
+static uint32_t t_dht, t_pot, t_lcd, t_boton;
+
+ISR(TIMER0_COMPA_vect) { ms++; }
+
+static uint32_t ahora(void)
+{
+    uint32_t valor;
+    uint8_t s = SREG;
+    cli();
+    valor = ms;
+    SREG = s;
+    return valor;
+}
+
+static void esperar_ms(uint16_t n)
+{
+    while (n--) _delay_ms(1);
+}
+
+static void iniciar_hardware(void)
+{
+    TCCR0A = (1 << WGM01);
+    TCCR0B = (1 << CS01) | (1 << CS00);
+    OCR0A = 249;
+    TIMSK0 = (1 << OCIE0A);
+
+    DDRD &= ~((1 << BOTON) | (1 << DHT));
+    PORTD |= (1 << BOTON) | (1 << DHT);
+
+    ADMUX = (1 << REFS0);
+    ADCSRA = (1 << ADEN) | (7 << ADPS0);
+
+    TWSR = 0;
+    TWBR = 72;
+    TWCR = (1 << TWEN);
+
+    DDRB |= (1 << SS) | (1 << PB3) | (1 << PB5);
+    DDRB &= ~(1 << PB4);
+    PORTB |= (1 << SS);
+    SPCR = (1 << SPE) | (1 << MSTR) | (1 << SPR1);
+    SPSR = 0;
+    sei();
+}
+
+static uint16_t adc(uint8_t canal)
+{
+    ADMUX = (ADMUX & 0xF0) | canal;
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC));
+    return ADC;
+}
+
+/* Comunicacion I2C y LCD */
+static void i2c_esperar(void)
+{
+    while (!(TWCR & (1 << TWINT)));
+}
+
+static void i2c_enviar(uint8_t dato)
+{
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    i2c_esperar();
+    TWDR = LCD_ADDR << 1;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    i2c_esperar();
+    TWDR = dato | LCD_LUZ;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    i2c_esperar();
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+
+static void lcd_nibble(uint8_t dato)
+{
+    i2c_enviar(dato | LCD_EN);
+    _delay_us(1);
+    i2c_enviar(dato & ~LCD_EN);
+    _delay_us(50);
+}
+
+static void lcd_enviar(uint8_t dato, uint8_t rs)
+{
+    lcd_nibble((dato & 0xF0) | rs);
+    lcd_nibble(((dato << 4) & 0xF0) | rs);
+}
+
+static void lcd_cmd(uint8_t dato) { lcd_enviar(dato, 0); }
+static void lcd_char(char c) { lcd_enviar((uint8_t)c, LCD_RS); }
+
+static void lcd_linea(uint8_t fila, const char *texto)
+{
+    uint8_t n = 0;
+    lcd_cmd(0x80 | (fila ? 0x40 : 0));
+    while (*texto && n < 16) {
+        lcd_char(*texto++);
+        n++;
+    }
+    while (n++ < 16) lcd_char(' ');
+}
+
+static void lcd_iniciar(void)
+{
+    esperar_ms(50);
+    lcd_nibble(0x30); _delay_ms(5);
+    lcd_nibble(0x30); _delay_ms(5);
+    lcd_nibble(0x30); _delay_us(150);
+    lcd_nibble(0x20);
+    lcd_cmd(0x28);
+    lcd_cmd(0x08);
+    lcd_cmd(0x01); _delay_ms(2);
+    lcd_cmd(0x06);
+    lcd_cmd(0x0C);
+}
+
