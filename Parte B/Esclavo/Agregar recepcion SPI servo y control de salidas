@@ -1,0 +1,89 @@
+  ISR(SPI_STC_vect)
+  {
+      uint8_t dato = SPDR;
+
+      if (fase_spi == 0) {
+          comando_recibido = dato;
+          fase_spi = 1;
+          SPDR = 0;
+      } else if (fase_spi == 1) {
+          valor_recibido = dato;
+          SPDR = trama_lista ? NACK : ACK;
+          if (!trama_lista) trama_lista = true;
+          fase_spi = 2;
+      } else {
+          fase_spi = 0;
+          SPDR = 0;
+      }
+  }
+
+  static uint32_t millis_c(void)
+  {
+      uint32_t copia;
+      uint8_t estado = SREG;
+      cli();
+      copia = milisegundos;
+      SREG = estado;
+      return copia;
+  }
+
+  static void servo_angulo(uint8_t angulo)
+  {
+      uint16_t pulso = 544U + (uint32_t)angulo * 1856U / 180U;
+      OCR1A = pulso * 2U;       /* Timer 1 avanza cada 0,5 us. */
+  }
+
+  static void motor_pwm(uint8_t valor)
+  {
+      if (valor == 0) {
+          TCCR0A &= ~(1 << COM0B1);
+          PORTD &= ~(1 << MOTOR_PWM);
+      } else if (valor == 255) {
+          TCCR0A &= ~(1 << COM0B1);
+          PORTD |= (1 << MOTOR_PWM);
+      } else {
+          OCR0B = (uint8_t)((uint16_t)valor * 249U / 255U);
+          TCCR0A |= (1 << COM0B1);
+      }
+  }
+
+  static void apagar_motor(void)
+  {
+      motor_pwm(0);
+      PORTD &= ~(1 << MOTOR_IN3);
+      PORTB &= ~(1 << MOTOR_IN4);
+  }
+
+  static void aplicar_motor(void)
+  {
+      if (!proceso_activo || emergencia) {
+          apagar_motor();
+          return;
+      }
+
+      PORTD |= (1 << MOTOR_IN3);
+      PORTB &= ~(1 << MOTOR_IN4);
+      motor_pwm(velocidad);
+  }
+
+  static void indicar_paro(void)
+  {
+      PORTD &= ~(1 << LED_VERDE);
+      PORTD &= ~(1 << LED_ROJO);
+      PORTB &= ~(1 << BUZZER);
+  }
+
+  static void indicar_marcha(void)
+  {
+      PORTD |= (1 << LED_VERDE);
+      PORTD &= ~(1 << LED_ROJO);
+      PORTB &= ~(1 << BUZZER);
+  }
+
+  static void indicar_emergencia(void)
+  {
+      PORTD &= ~(1 << LED_VERDE);
+      PORTD |= (1 << LED_ROJO);
+      PORTB |= (1 << BUZZER);
+  }
+
