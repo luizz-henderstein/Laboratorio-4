@@ -1,0 +1,78 @@
+static uint8_t spi_byte(uint8_t dato)
+{
+    SPDR = dato;
+    while (!(SPSR & (1 << SPIF)));
+    return SPDR;
+}
+
+static bool enviar_trama(uint8_t cmd, uint8_t valor)
+{
+    uint8_t respuesta;
+    PORTB &= ~(1 << SS);
+    _delay_us(5);
+    spi_byte(cmd);
+    spi_byte(valor);
+    respuesta = spi_byte(0);
+    _delay_us(5);
+    PORTB |= (1 << SS);
+    return respuesta == ACK;
+}
+
+static void iniciar_proceso(void)
+{
+    if (enviar_trama(CMD_START, 0)) ultimo_cmd = "START";
+    _delay_ms(2);
+    enviar_trama(CMD_VEL, velocidad);
+}
+
+static bool dht_alto(void) { return (PIND & (1 << DHT)) != 0; }
+
+static bool esperar_cambio(bool nivel, uint8_t limite)
+{
+    while (dht_alto() == nivel) {
+        if (!limite--) return false;
+        _delay_us(1);
+    }
+    return true;
+}
+
+static bool leer_dht(float *temp, float *hum)
+{
+    uint8_t datos[5] = {0}, i, s;
+    bool correcto = false;
+
+    DDRD |= (1 << DHT);
+    PORTD &= ~(1 << DHT);
+    esperar_ms(20);
+    DDRD &= ~(1 << DHT);
+    PORTD |= (1 << DHT);
+    _delay_us(30);
+
+    s = SREG;
+    cli();
+    if (!esperar_cambio(true, 100) || !esperar_cambio(false, 100) ||
+        !esperar_cambio(true, 100)) goto fin;
+
+    for (i = 0; i < 40; i++) {
+        if (!esperar_cambio(false, 70)) goto fin;
+        _delay_us(40);
+        datos[i / 8] <<= 1;
+        if (dht_alto()) {
+            datos[i / 8] |= 1;
+            if (!esperar_cambio(true, 50)) goto fin;
+        }
+    }
+
+    if ((uint8_t)(datos[0] + datos[1] + datos[2] + datos[3]) != datos[4])
+        goto fin;
+
+    *hum = datos[0] + datos[1] / 10.0f;
+    *temp = (datos[2] & 0x7F) + datos[3] / 10.0f;
+    if (datos[2] & 0x80) *temp = -*temp;
+    correcto = true;
+
+fin:
+    SREG = s;
+    return correcto;
+}
+
