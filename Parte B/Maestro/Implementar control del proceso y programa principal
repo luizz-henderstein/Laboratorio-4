@@ -1,0 +1,120 @@
+static void revisar_boton(void)
+{
+    bool lectura = (PIND & (1 << BOTON)) != 0;
+    uint32_t tiempo = ahora();
+
+    if (lectura != boton_anterior) {
+        boton_anterior = lectura;
+        t_boton = tiempo;
+    }
+
+    if (tiempo - t_boton > 35 && lectura != boton_estable) {
+        boton_estable = lectura;
+        if (!lectura) {
+            if (emergencia) {
+                if (temp_valida && temperatura <= 35.0f) {
+                    emergencia = false;
+                    activo = true;
+                    iniciar_proceso();
+                }
+            } else {
+                activo = !activo;
+                if (activo) iniciar_proceso();
+                else {
+                    enviar_trama(CMD_STOP, 0);
+                    ultimo_cmd = "STOP";
+                }
+            }
+        }
+    }
+}
+
+static void leer_potenciometro(void)
+{
+    int16_t diferencia;
+    uint32_t tiempo = ahora();
+    if (tiempo - t_pot < 100) return;
+    t_pot = tiempo;
+
+    velocidad = (uint8_t)((uint32_t)adc(1) * 255 / 1023);
+    diferencia = (int16_t)velocidad - ultima_velocidad;
+    if (diferencia < 0) diferencia = -diferencia;
+
+    if (activo && !emergencia && diferencia >= 3 &&
+        enviar_trama(CMD_VEL, velocidad)) {
+        ultima_velocidad = velocidad;
+        ultimo_cmd = "VEL";
+    }
+}
+
+static void leer_ldr(void)
+{
+    uint16_t lectura = adc(0);
+    if (!pieza && lectura < 400) {
+        pieza = true;
+        if (activo && !emergencia) {
+            contador++;
+            if (enviar_trama(CMD_PISTON, 0)) ultimo_cmd = "PIST";
+        }
+    } else if (pieza && lectura > 500) {
+        pieza = false;
+    }
+}
+
+static void revisar_temperatura(void)
+{
+    uint32_t tiempo = ahora();
+    float t, h;
+    if (tiempo - t_dht < 3000) return;
+    t_dht = tiempo;
+
+    temp_valida = leer_dht(&t, &h);
+    if (!temp_valida) return;
+    temperatura = t;
+    humedad = h;
+
+    if (!emergencia && temperatura >= 40.0f) {
+        emergencia = true;
+        activo = false;
+        enviar_trama(CMD_EMERG, 0);
+        ultimo_cmd = "EMERG";
+    }
+}
+
+static void actualizar_lcd(void)
+{
+    char linea1[17], linea2[17], estado;
+    uint32_t tiempo = ahora();
+    if (tiempo - t_lcd < 250) return;
+    t_lcd = tiempo;
+
+    estado = emergencia ? 'E' : (activo ? 'R' : 'S');
+    if (temp_valida)
+        snprintf(linea1, 17, "%c T:%2d V:%3u", estado,
+                 (int)temperatura, (unsigned)velocidad);
+    else
+        snprintf(linea1, 17, "%c T:-- V:%3u", estado, (unsigned)velocidad);
+
+    snprintf(linea2, 17, "P:%03u C:%-5s",
+             (unsigned)(contador % 1000), ultimo_cmd);
+    lcd_linea(0, linea1);
+    lcd_linea(1, linea2);
+}
+
+int main(void)
+{
+    iniciar_hardware();
+    esperar_ms(3000);
+    lcd_iniciar();
+    lcd_linea(0, "Proceso SPI");
+    lcd_linea(1, "Sistema listo");
+    t_dht = ahora();
+
+    while (1) {
+        revisar_boton();
+        leer_potenciometro();
+        leer_ldr();
+        revisar_temperatura();
+        actualizar_lcd();
+    }
+}
