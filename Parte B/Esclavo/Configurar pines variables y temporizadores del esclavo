@@ -1,0 +1,57 @@
+  #define F_CPU 16000000UL
+
+  #include <avr/io.h>
+  #include <avr/interrupt.h>
+  #include <stdint.h>
+  #include <stdbool.h>
+
+  #define SERVO       PD3
+  #define LED_VERDE   PD4
+  #define MOTOR_PWM   PD5
+  #define LED_ROJO    PD6
+  #define MOTOR_IN3   PD7
+  #define MOTOR_IN4   PB0
+  #define BUZZER      PB1
+  #define SS          PB2
+
+  #define ANGULO_REPOSO     10
+  #define ANGULO_PISTON     90
+  #define TIEMPO_PISTON     500UL
+  #define ACK                0xA5
+  #define NACK               0x5A
+
+  enum {
+      CMD_START = 0x10,
+      CMD_STOP = 0x11,
+      CMD_SET_SPEED = 0x20,
+      CMD_PISTON = 0x30,
+      CMD_EMERGENCY = 0x40
+  };
+
+  static volatile uint32_t milisegundos = 0;
+  static volatile uint8_t fase_spi = 0;
+  static volatile uint8_t comando_recibido = 0;
+  static volatile uint8_t valor_recibido = 0;
+  static volatile bool trama_lista = false;
+
+  static bool proceso_activo = false;
+  static bool emergencia = false;
+  static bool piston_extendido = false;
+  static uint8_t velocidad = 0;
+  static uint32_t retorno_piston = 0;
+
+  ISR(TIMER0_OVF_vect)
+  {
+      milisegundos++;
+  }
+
+  ISR(TIMER1_OVF_vect)
+  {
+      PORTD |= (1 << SERVO);
+  }
+
+  ISR(TIMER1_COMPA_vect)
+  {
+      PORTD &= ~(1 << SERVO);
+  }
+
